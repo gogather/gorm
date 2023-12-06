@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	goerr "github.com/go-errors/errors"
 )
 
 // DB contains information for current db connection
@@ -83,9 +85,12 @@ func Open(dialect string, args ...interface{}) (db *DB, err error) {
 	}
 
 	db = &DB{
-		db:        dbSQL,
-		logger:    defaultLogger,
-		callbacks: DefaultCallback,
+		db:     dbSQL,
+		logger: defaultLogger,
+
+		// Create a clone of the default logger to avoid mutating a shared object when
+		// multiple gorm connections are created simultaneously.
+		callbacks: DefaultCallback.clone(defaultLogger),
 		dialect:   newDialect(dialect, dbSQL),
 	}
 	db.parent = db
@@ -624,7 +629,7 @@ func (s *DB) NewRecord(value interface{}) bool {
 // RecordNotFound check if returning ErrRecordNotFound error
 func (s *DB) RecordNotFound() bool {
 	for _, err := range s.GetErrors() {
-		if err == ErrRecordNotFound {
+		if err.Error() == ErrRecordNotFound.Error() {
 			return true
 		}
 	}
@@ -805,10 +810,22 @@ func (s *DB) SetJoinTableHandler(source interface{}, column string, handler Join
 	}
 }
 
+func (s *DB) toGoErr(err error) error{
+	if err == nil {
+		return nil
+	}
+	_, ok := err.(*goerr.Error)
+	if !ok {
+		err = goerr.New(err)
+	}
+	return err
+}
+
 // AddError add error to the db
 func (s *DB) AddError(err error) error {
 	if err != nil {
-		if err != ErrRecordNotFound {
+		err = s.toGoErr(err)
+		if !IsRecordNotFoundError(err) {
 			if s.logMode == defaultLogMode {
 				go s.print("error", fileWithLineNum(), err)
 			} else {
@@ -829,6 +846,15 @@ func (s *DB) AddError(err error) error {
 
 // GetErrors get happened errors from the db
 func (s *DB) GetErrors() []error {
+	errs := s.getErrors()
+	wrapperErrors := []error{}
+	for _, err := range errs {
+		wrapperErrors = append(wrapperErrors, s.toGoErr(err))
+	}
+	return wrapperErrors
+}
+
+func (s *DB) getErrors() []error {
 	if errs, ok := s.Error.(Errors); ok {
 		return errs
 	} else if s.Error != nil {
